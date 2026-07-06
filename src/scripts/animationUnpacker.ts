@@ -88,6 +88,12 @@ export class AnimationUnpacker {
   plyCacheOrder: number[] = [];
   maxPlyCache = 30;
 
+  /**
+   * 核心加载逻辑：
+   * 1. 为什么分离？标准的 3DGS 动画通常每一帧都是一个完整的 PLY 文件（包含大量的颜色、球谐、不透明度等冗余静态数据），导致体积不可接受。
+   * 2. 优化方案：这里将静态属性抽取为单独的基底 PLY（basePlyUrl），把每一帧唯一变化的属性（位置、旋转四元数）压缩成了 NPZ 文件。
+   * 3. 本方法的作用：并行下载这两个文件，通过流式加载（Stream）实时抛出进度，合并校验后存放在内存中，供后续按帧组装。
+   */
   async load({
     basePlyUrl,
     npzUrl,
@@ -96,6 +102,7 @@ export class AnimationUnpacker {
   }: AnimationLoadOptions): Promise<AnimationLoadResult> {
     const plyParser = createPlyStreamParser();
 
+    // 记录 PLY 和 NPZ 两个大文件的下载进度
     let plyLoaded = 0;
     let plyTotal = 0;
     let npzLoaded = 0;
@@ -112,6 +119,8 @@ export class AnimationUnpacker {
 
     const streamOptions = signal ? { signal } : undefined;
 
+    // 【1. NPZ 动画轨迹数据的下载与解压任务】
+    // 将 NPZ 分片流全量收集到 chunks，待下载完毕后合并成完整 buffer 丢给 `parseNpz` (JSZip) 进行解压和解析
     const npzBufferPromise = (async () => {
       const chunks: Uint8Array[] = [];
       await streamUrl(
@@ -135,6 +144,9 @@ export class AnimationUnpacker {
       return parseNpz(merged.buffer);
     })();
 
+    // 【2. PLY 基底模型的下载任务（与 NPZ 并行）】
+    // 因为 PLY 我们自己实现了一个渐进式的 WASM 解析器（createPlyStreamParser），
+    // 它可以做到一边下载 chunk，一边将字节流 append 进去进行解析，无需等整个文件下完。
     await Promise.all([
       streamUrl(
         basePlyUrl,
@@ -151,8 +163,10 @@ export class AnimationUnpacker {
     ]);
 
     onProgress?.('正在解析基底 PLY 与动画轨迹...');
+    
+    // 取出 PLY 的解析结果和 NPZ 解压出来的数据字典
     const [plyData, npz] = await Promise.all([plyParser.done, npzBufferPromise]);
-    this.applyBasePly(plyData);
+    this.applyBasePly(plyData); // 将解析出的 PLY 头部定义和顶点模板缓存起来
 
     if (!npz.positions || !npz.rotations) {
       const found = Object.keys(npz).join(', ') || '无';
@@ -164,9 +178,14 @@ export class AnimationUnpacker {
     this.numPoints = numPoints;
 
     onProgress?.(`正在转换动画数据（${numFrames} 帧 × ${numPoints} 点）...`);
+    
+    // 【3. 类型转换】
+    // 从 npz.js 解出来的 Float32/Float64 转换为我们引擎计算所需的统一下标连续数组
     this.positions = toNumberArray(npz.positions.data);
     this.rotations = toNumberArray(npz.rotations.data);
 
+    // 【4. 数据一致性校验（非常关键的容错机制）】
+    // 确保动画每一帧的“点”数量（3维位置 和 4维四元数）完全对得上。
     const expectedPos = numFrames * numPoints * 3;
     const expectedRot = numFrames * numPoints * 4;
 

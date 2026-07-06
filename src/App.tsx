@@ -294,7 +294,12 @@ function usePlayCanvasScene(canvasRef: RefObject<HTMLCanvasElement | null>) {
       try {
         setState(prev => ({ ...prev, loading: true, error: null, message: '正在并行下载场景与动画资源...' }));
 
-        // 并行：解析 NPZ + 下载基底 PLY；同时加载场景 SOG
+        // 并行加载：
+        // 1. unpacker: 负责下载巨大的 npz(动画帧) 和 ply(基底)，并用 WASM 极速解压，耗时最长，因此提供 onProgress 刷新 UI。
+        // 2. loadStaticGsplat: 负责加载背景房间(sog)，文件较小(20MB)，由引擎底层直接处理，所以没做进度通知。
+        // 【异常处理策略】：这里使用了 Promise.all，它的特性是“一损俱损”。
+        // 只要任何一个任务（不管房间还是人物）下载失败或超时，就会立刻抛出异常进入下面的 catch 块，
+        // 我们认为这两者缺一不可，只有都成功才算 ready。
         const [, sceneEntity] = await Promise.all([
           unpacker.load({
             basePlyUrl: ASSET_URLS.basePly,
@@ -317,21 +322,36 @@ function usePlayCanvasScene(canvasRef: RefObject<HTMLCanvasElement | null>) {
         const endFrame = unpacker.numFrames - 1;
 
         // ── 4. 创建动画角色实体 + flipbook 脚本（对齐原版）
+        // 创建一个用于承载 3DGS 动画的新实体
         const player = new Entity('SplatAnimation');
+        // 将模型绕X轴翻转180度，以解决高斯溅射模型在不同坐标系下可能出现的上下颠倒问题
         player.setLocalEulerAngles(180, 0, 0);
+        // 添加 gsplat 组件，`unified: true` 启用统一渲染架构，有助于提升渲染性能和批处理效率
         player.addComponent('gsplat', { unified: true });
+        // 添加脚本组件，为挂载自定义的动画控制逻辑做准备
         player.addComponent('script');
+        // 挂载 `GsplatFlipbookDynamic` 脚本实例。该脚本负责动态读取并播放 3DGS 动画序列帧
         const flipbook = player.script!.create(GsplatFlipbookDynamic) as unknown as FlipbookScript;
+        // 将 flipbook 脚本实例保存到 ref 中，以便在组件的其他生命周期或外部逻辑中控制动画的播放/暂停等
         flipbookRef.current = flipbook;
 
+        // --- 配置动画控制脚本 ---
+        // 指定帧数据提供者：使用前面实例化的 unpacker 负责按需读取和解包帧数据
         flipbook.frameProvider = unpacker;
+        // 设置动画播放帧率
         flipbook.fps = DEFAULT_ANIMATION_FPS;
+        // 设置动画播放的起始帧索引
         flipbook.startFrame = START_FRAME;
+        // 设置动画播放的结束帧索引
         flipbook.endFrame = endFrame;
+        // 播放模式设为循环播放（loop）
         flipbook.playMode = 'loop';
-        flipbook.playing = true;          // 对齐原版：在 waitForFirstFrame 前就 true
+        // 激活播放状态。注意：这里在等待第一帧就绪前就设置为 true，是为了尽早触发内部的帧预加载流程（与原版实现对齐）
+        flipbook.playing = true;
+        // 设置缓存策略：后台提前预加载指定数量的后续帧，以保证播放流畅，避免卡顿
         flipbook.preloadCount = NORMAL_PRELOAD_COUNT;
 
+        // 将实体初始位置设为原点
         player.setLocalPosition(0, 0, 0);
         app.root.addChild(player);
 

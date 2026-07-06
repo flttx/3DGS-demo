@@ -125,16 +125,31 @@ function readArrayBuffer(
   return f32;
 }
 
+/**
+ * 解析标准的 Python NumPy 二进制文件 (.npy)
+ * .npy 文件的结构通常是：
+ * 1. 6 字节魔数 (Magic String): \x93NUMPY
+ * 2. 2 字节版本号 (Major, Minor)
+ * 3. 2 或 4 字节的 Header 长度
+ * 4. Header 字符串 (包含描述类型、形状和存储顺序的 Python 字典)
+ * 5. 纯二进制的连续数据块
+ */
 export function parseNpy(input: ArrayBuffer | Uint8Array): NpyArray {
   const bytes = input instanceof Uint8Array ? input : new Uint8Array(input);
+  
+  // 【1. 校验魔数】
+  // 确保前 6 个字节是标准的 NumPy 标识符
   const magic = String.fromCharCode(...bytes.slice(0, 6));
   if (magic !== '\x93NUMPY') {
     throw new Error('Not a valid NPY file');
   }
 
+  // 【2. 读取版本与头部长度】
+  // bytes[6] 是主版本号 (Major Version)。
+  // Version 1 使用 2 个字节记录 Header 长度；Version 2 使用 4 个字节。
   const major = bytes[6];
   let headerLen: number;
-  let dataOffset: number;
+  let dataOffset: number; // 纯数据块开始的字节偏移量
 
   if (major === 1) {
     headerLen = bytes[8] | (bytes[9] << 8);
@@ -146,15 +161,25 @@ export function parseNpy(input: ArrayBuffer | Uint8Array): NpyArray {
     throw new Error(`Unsupported NPY version: ${major}`);
   }
 
+  // 【3. 解析 Header 字典】
+  // Header 是一段 ASCII 编码的字符串，长得像 Python 字典："{'descr': '<f4', 'fortran_order': False, 'shape': (100, 3), }"
   const headerStr = new TextDecoder('ascii').decode(
     bytes.slice(major === 1 ? 10 : 12, dataOffset),
   );
+  // 解析出 数据类型(descr)、存储顺序(fortranOrder) 和 多维形状(shape)
   const { descr, fortranOrder, shape } = parseHeaderLiteral(headerStr);
 
+  // 【4. 截取并转换数据块】
+  // 计算数组总元素个数
   const count = shape.reduce((acc, dim) => acc * dim, 1);
   const dataBytes = bytes.slice(dataOffset, dataOffset + count * elementSize(descr));
+  // 根据 descr (如 <f4 代表 Float32) 将二进制字节流转为强类型数组 (如 Float32Array)
   let data = readArrayBuffer(dataBytes.buffer, descr, true, count);
 
+  // 【5. 处理 Fortran Order (列优先存储)】
+  // C 语言/JavaScript 默认是行优先 (Row-major)，而 Fortran 是列优先 (Column-major)。
+  // 如果原始数据是以 Fortran 顺序保存的，我们需要手动将它转置回 C 顺序，
+  // 否则后续交给 WebGL 渲染时，坐标和颜色的步长就全部错位了。
   if (fortranOrder && shape.length === 2) {
     const [rows, cols] = shape;
     const reordered = new Float32Array(count);
